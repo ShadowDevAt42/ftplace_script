@@ -76,12 +76,15 @@ IDs des couleurs :
 ## Utilisation
 
 ```bash
-cargo run --release -- \
-    --refresh-token "votre_refresh_token" \
-    --token "votre_token" \
-    --start-x <x_depart> \
-    --start-y <y_depart> \
-    --pattern-file "pattern/votre_pattern.json"
+cargo run -- \
+  --refresh-token "votre_refresh_token" \
+  --token "votre_token" \
+  --defensive-x 100 \
+  --defensive-y 100 \
+  --defensive-pattern "chemin/vers/pattern_defensif.json" \
+  --build-x 200 \
+  --build-y 200 \
+  --build-pattern "chemin/vers/pattern_construction.json"
 ```
 
 ## Fonctionnalités
