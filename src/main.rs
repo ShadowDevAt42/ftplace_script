@@ -38,13 +38,22 @@ struct Args {
     token: String,
 
     #[arg(long)]
-    defensive_x: u32,
+    defensive1_x: u32,
 
     #[arg(long)]
-    defensive_y: u32,
+    defensive1_y: u32,
 
     #[arg(long)]
-    defensive_pattern: String,
+    defensive1_pattern: String,
+
+    #[arg(long)]
+    defensive2_x: u32,
+
+    #[arg(long)]
+    defensive2_y: u32,
+
+    #[arg(long)]
+    defensive2_pattern: String,
 
     #[arg(long)]
     build_x: u32,
@@ -350,9 +359,12 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     
-    // Chargement des deux patterns
-    let defensive_content = fs::read_to_string(&args.defensive_pattern)?;
-    let defensive_pattern: Pattern = serde_json::from_str(&defensive_content)?;
+    // Chargement des patterns
+    let defensive1_content = fs::read_to_string(&args.defensive1_pattern)?;
+    let defensive1_pattern: Pattern = serde_json::from_str(&defensive1_content)?;
+    
+    let defensive2_content = fs::read_to_string(&args.defensive2_pattern)?;
+    let defensive2_pattern: Pattern = serde_json::from_str(&defensive2_content)?;
     
     let build_content = fs::read_to_string(&args.build_pattern)?;
     let build_pattern: Pattern = serde_json::from_str(&build_content)?;
@@ -375,21 +387,39 @@ async fn main() -> Result<()> {
         let mut total_pixels_placed = 0;
         let mut needs_wait = false;
 
-        // Traitement prioritaire du pattern défensif
-        let (defensive_pixels, wait_needed) = client.process_pattern(
+        // Traitement prioritaire du premier pattern défensif
+        let (defensive1_pixels, wait_needed) = client.process_pattern(
             &mut auth,
-            &defensive_pattern,
-            args.defensive_x,
-            args.defensive_y,
+            &defensive1_pattern,
+            args.defensive1_x,
+            args.defensive1_y,
             &board,
             &colors,
             MAX_PIXELS_PER_BATCH
         ).await?;
 
-        total_pixels_placed += defensive_pixels;
+        total_pixels_placed += defensive1_pixels;
         needs_wait = wait_needed;
 
-        // Si on n'a pas utilisé tous nos pixels sur la défense et qu'on n'a pas besoin d'attendre,
+        // Si on n'a pas utilisé tous nos pixels sur la première défense et qu'on n'a pas besoin d'attendre,
+        // on passe au deuxième pattern défensif
+        if !needs_wait && total_pixels_placed < MAX_PIXELS_PER_BATCH {
+            let remaining_pixels = MAX_PIXELS_PER_BATCH - total_pixels_placed;
+            let (defensive2_pixels, wait_needed) = client.process_pattern(
+                &mut auth,
+                &defensive2_pattern,
+                args.defensive2_x,
+                args.defensive2_y,
+                &board,
+                &colors,
+                remaining_pixels
+            ).await?;
+
+            total_pixels_placed += defensive2_pixels;
+            needs_wait = wait_needed;
+        }
+
+        // Si on n'a toujours pas utilisé tous nos pixels et qu'on n'a pas besoin d'attendre,
         // on travaille sur le pattern de construction
         if !needs_wait && total_pixels_placed < MAX_PIXELS_PER_BATCH {
             let remaining_pixels = MAX_PIXELS_PER_BATCH - total_pixels_placed;
