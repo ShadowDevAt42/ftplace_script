@@ -140,12 +140,12 @@ impl PlaceClient {
            }
        }
 
-       // Miroir vertical
+       // Miroir vertical 
        let mut final_matrix = vec![vec![0u8; BOARD_SIZE]; BOARD_SIZE];
        for y in 0..BOARD_SIZE {
            for x in 0..BOARD_SIZE {
                final_matrix[y][BOARD_SIZE - 1 - x] = rotated_matrix[y][x];
-           }
+           }  
        }
 
        info!("Board matrix constructed successfully");
@@ -205,10 +205,17 @@ impl PlaceClient {
 
            debug!("New tokens: refresh={}, token={}", auth.refresh_token, auth.token);
            return Ok(true);
-       }
+       } 
 
        if !status.is_success() {
-           return Err(anyhow!("Request failed with status: {} - {}", status, response_text));
+          let error_message: serde_json::Value = serde_json::from_str(&response_text)?;
+          if let Some(message) = error_message.get("message") {
+              if message.as_str() == Some("Too early") {
+                  info!("Received 'Too early' error, waiting {} minutes before retrying", BATCH_DELAY_MINUTES);
+                  return Err(anyhow!("Too early"));
+              }
+          }
+          return Err(anyhow!("Request failed with status: {} - {}", status, response_text));
        }
 
        info!("Successfully placed pixel at ({}, {}) with color id {}", x, y, color_id);
@@ -244,7 +251,7 @@ fn save_board_state(colors: &HashMap<u8, Color>, board: &Vec<Vec<u8>>, timestamp
                    x as u32,
                    y as u32,
                    Rgb([color.red, color.green, color.blue])
-               );
+               ); 
            }
        }
    }
@@ -281,7 +288,13 @@ async fn main() -> Result<()> {
        let (colors, board) = client.get_board().await?;
        save_board_state(&colors, &board, &timestamp)?;
 
+       let mut pixels_placed = 0;
+
        for p in &pattern.pattern {
+           if pixels_placed >= MAX_PIXELS_PER_BATCH {
+               break;
+           }
+
            let target_x = args.start_x + p.x;
            let target_y = args.start_y + p.y;
            
@@ -297,18 +310,27 @@ async fn main() -> Result<()> {
                while retries < max_retries {
                    match client.place_pixel(&mut auth, target_x, target_y, p.color, &colors).await {
                        Ok(needs_refresh) => {
-                           if !needs_refresh {
+                           if needs_refresh {
+                               info!("Retrying with new tokens");
+                           } else {
                                info!("Successfully placed pixel at ({}, {})", target_x, target_y);
+                               pixels_placed += 1;
                                break;
                            }
-                           info!("Retrying with new tokens");
                        },
                        Err(e) => {
-                           error!("Failed to place pixel: {}", e);
-                           retries += 1;
-                           if retries >= max_retries {
-                               error!("Max retries reached for pixel ({}, {}), skipping", target_x, target_y);
+                           let error_message = e.to_string();
+                           if error_message.contains("Too early") {
+                               info!("Received 'Too early' error, waiting {} minutes before retrying", BATCH_DELAY_MINUTES);
+                               sleep(Duration::from_secs(BATCH_DELAY_MINUTES * 60)).await;
                                break;
+                           } else {
+                               error!("Failed to place pixel: {}", e);
+                               retries += 1;
+                               if retries >= max_retries {
+                                   error!("Max retries reached for pixel ({}, {}), skipping", target_x, target_y);
+                                   break;
+                               }
                            }
                        }
                    }
@@ -321,7 +343,8 @@ async fn main() -> Result<()> {
            sleep(Duration::from_secs(1)).await;
        }
 
-       info!("Batch complete, waiting {} minutes before next batch", BATCH_DELAY_MINUTES);
+       info!("Placed {} pixels in this batch", pixels_placed);
+       info!("Waiting {} minutes before next batch", BATCH_DELAY_MINUTES);
        sleep(Duration::from_secs(BATCH_DELAY_MINUTES * 60)).await;
    }
 }
