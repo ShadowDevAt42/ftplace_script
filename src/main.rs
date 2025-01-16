@@ -334,13 +334,13 @@ async fn main() -> Result<()> {
                            }
                        }
                    }
-                   sleep(Duration::from_secs(1)).await;
+                   // Réduit le délai entre les tentatives à 500ms
+                   sleep(Duration::from_millis(500)).await;
                }
            } else {
                debug!("Pixel at ({}, {}) already has correct color {}", target_x, target_y, p.color);
+               // Pas de délai pour la vérification des pixels existants
            }
-
-           sleep(Duration::from_secs(1)).await;
        }
 
        info!("Placed {} pixels in this batch", pixels_placed);
