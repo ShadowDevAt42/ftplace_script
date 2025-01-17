@@ -7,7 +7,7 @@ use env_logger::Builder;
 use std::collections::HashMap;
 use image::{ImageBuffer, Rgb};
 use std::fs;
-use chrono::Local;
+use chrono::{Local, Utc};
 use clap::Parser;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -26,6 +26,12 @@ struct PatternPixel {
     x: u32,
     y: u32,
     color: u8,
+}
+
+#[derive(Deserialize, Debug)]
+struct TimerResponse {
+    timers: Vec<String>,
+    message: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -118,6 +124,51 @@ impl PlaceClient {
         })
     }
 
+    fn calculate_wait_interval(&self, response: &str) -> Result<Duration> {
+        let timer_response: TimerResponse = serde_json::from_str(response)?;
+        let mut earliest_available = None;
+
+        println!("=====================================================");
+        println!("{:?}", timer_response.timers);
+        println!("=====================================================");
+
+        for timer in timer_response.timers {
+            if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(&timer) {
+                let utc_timestamp = timestamp.with_timezone(&chrono::Utc);
+
+                info!("Pixel will be available at: {}", utc_timestamp.format("%H:%M:%S"));
+
+                if let Some(current_earliest) = earliest_available {
+                    if utc_timestamp < current_earliest {
+                        earliest_available = Some(utc_timestamp);
+                    }
+                } else {
+                    earliest_available = Some(utc_timestamp);
+                }
+            }
+        }
+
+        if let Some(available_time) = earliest_available {
+            let now = Utc::now();
+            if available_time > now {
+                let wait_duration = available_time.signed_duration_since(now);
+                let total_seconds = wait_duration.num_seconds() as u64;
+                let minutes = total_seconds / 60;
+                let seconds = total_seconds % 60;
+
+                info!("Current time: {}", now.format("%H:%M:%S"));
+                info!("Target time: {}", available_time.format("%H:%M:%S"));
+                info!("Need to wait: {}m {}s until first pixel is available", minutes, seconds);
+
+                // Add 1 second buffer to ensure we're past the timeout
+                return Ok(Duration::from_secs(total_seconds + 1));
+            }
+        }
+
+        // If it goes wrong try the old method and wait 31 minutes
+        Ok(Duration::from_secs(BATCH_DELAY_MINUTES * 60))
+    }
+
     async fn get_board(&self) -> Result<(HashMap<u8, Color>, Vec<Vec<u8>>)> {
         let url = format!("{}/api/get?type=board", self.base_url);
         debug!("Requesting board from URL: {}", url);
@@ -150,7 +201,6 @@ impl PlaceClient {
             }
         }
 
-        // Rotation de 90 degrés vers la droite
         let mut rotated_matrix = vec![vec![0u8; BOARD_SIZE]; BOARD_SIZE];
         for y in 0..BOARD_SIZE {
             for x in 0..BOARD_SIZE {
@@ -158,7 +208,6 @@ impl PlaceClient {
             }
         }
 
-        // Miroir vertical 
         let mut final_matrix = vec![vec![0u8; BOARD_SIZE]; BOARD_SIZE];
         for y in 0..BOARD_SIZE {
             for x in 0..BOARD_SIZE {
@@ -170,7 +219,7 @@ impl PlaceClient {
         Ok((colors, final_matrix))
     }
 
-    async fn place_pixel(&self, auth: &mut Auth, x: u32, y: u32, color_id: u8, colors: &HashMap<u8, Color>) -> Result<bool> {
+    async fn place_pixel(&self, auth: &mut Auth, x: u32, y: u32, color_id: u8, colors: &HashMap<u8, Color>) -> Result<(bool, Option<Duration>)> {
         let url = format!("{}/api/set", self.base_url);
         
         let request = PlacePixelRequest {
@@ -193,10 +242,7 @@ impl PlaceClient {
             .header("Sec-Fetch-Dest", "empty")
             .header("Sec-Fetch-Mode", "cors")
             .header("Sec-Fetch-Site", "same-origin")
-            .header("Cookie", format!(
-                "refresh={}; token={}",
-                auth.refresh_token, auth.token
-            ))
+            .header("Cookie", format!("refresh={}; token={}", auth.refresh_token, auth.token))
             .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:134.0) Gecko/20100101 Firefox/134.0")
             .json(&request)
             .send()
@@ -222,22 +268,34 @@ impl PlaceClient {
             }
 
             debug!("New tokens: refresh={}, token={}", auth.refresh_token, auth.token);
-            return Ok(true);
+            return Ok((true, None));
         } 
 
         if !status.is_success() {
-            let error_message: serde_json::Value = serde_json::from_str(&response_text)?;
-            if let Some(message) = error_message.get("message") {
-                if message.as_str() == Some("Too early") {
-                    info!("Received 'Too early' error, waiting {} minutes before retrying", BATCH_DELAY_MINUTES);
-                    return Err(anyhow!("Too early"));
+            let timer_response: Result<TimerResponse, _> = serde_json::from_str(&response_text);
+            
+            if let Ok(timer_response) = timer_response {
+                if timer_response.message.as_deref() == Some("Too early") {
+                    let wait_duration = self.calculate_wait_interval(&response_text)?;
+                    info!("Waiting for {:?} before retrying", wait_duration);
+                    return Ok((false, Some(wait_duration)));
                 }
             }
             return Err(anyhow!("Request failed with status: {} - {}", status, response_text));
         }
 
+        // Pour les réponses réussies, on extrait aussi les timers
+        let timer_response: Result<TimerResponse, _> = serde_json::from_str(&response_text);
+        let mut wait_duration = None;
+        if let Ok(timer_response) = timer_response {
+            if !timer_response.timers.is_empty() {
+                wait_duration = Some(self.calculate_wait_interval(&response_text)?);
+                info!("Next pixel available in {:?}", wait_duration);
+            }
+        }
+
         info!("Successfully placed pixel at ({}, {}) with color id {}", x, y, color_id);
-        Ok(false)
+        Ok((false, wait_duration))
     }
 
     async fn process_pattern(&self, 
@@ -248,9 +306,9 @@ impl PlaceClient {
         board: &Vec<Vec<u8>>,
         colors: &HashMap<u8, Color>,
         max_pixels: usize
-    ) -> Result<(usize, bool)> {
+    ) -> Result<(usize, Option<Duration>)> {
         let mut pixels_placed = 0;
-        let mut needs_wait = false;
+        let mut wait_duration = None;
 
         for p in &pattern.pattern {
             if pixels_placed >= max_pixels {
@@ -271,35 +329,32 @@ impl PlaceClient {
 
                 while retries < max_retries {
                     match self.place_pixel(auth, target_x, target_y, p.color, colors).await {
-                        Ok(needs_refresh) => {
+                        Ok((needs_refresh, new_wait_duration)) => {
                             if needs_refresh {
                                 info!("Retrying with new tokens");
                             } else {
+                                if let Some(duration) = new_wait_duration {
+                                    wait_duration = Some(duration);
+                                    break;
+                                }
                                 info!("Successfully placed pixel at ({}, {})", target_x, target_y);
                                 pixels_placed += 1;
                                 break;
                             }
                         },
                         Err(e) => {
-                            let error_message = e.to_string();
-                            if error_message.contains("Too early") {
-                                info!("Received 'Too early' error");
-                                needs_wait = true;
+                            error!("Failed to place pixel: {}", e);
+                            retries += 1;
+                            if retries >= max_retries {
+                                error!("Max retries reached for pixel ({}, {}), skipping", target_x, target_y);
                                 break;
-                            } else {
-                                error!("Failed to place pixel: {}", e);
-                                retries += 1;
-                                if retries >= max_retries {
-                                    error!("Max retries reached for pixel ({}, {}), skipping", target_x, target_y);
-                                    break;
-                                }
                             }
                         }
                     }
                     sleep(Duration::from_millis(500)).await;
                 }
 
-                if needs_wait {
+                if wait_duration.is_some() {
                     break;
                 }
             } else {
@@ -307,7 +362,7 @@ impl PlaceClient {
             }
         }
 
-        Ok((pixels_placed, needs_wait))
+        Ok((pixels_placed, wait_duration))
     }
 }
 
@@ -377,68 +432,88 @@ async fn main() -> Result<()> {
         token: args.token,
     };
 
+    let mut next_update = Utc::now();
+    
     loop {
-        let now = Local::now();
-        let timestamp = now.format("%Y-%m-%d_%H-%M-%S").to_string();
+        if Utc::now() >= next_update {
+            let now = Local::now();
+            let timestamp = now.format("%Y-%m-%d_%H-%M-%S").to_string();
 
-        let (colors, board) = client.get_board().await?;
-        save_board_state(&colors, &board, &timestamp)?;
+            let (colors, board) = client.get_board().await?;
+            save_board_state(&colors, &board, &timestamp)?;
 
-        let mut total_pixels_placed = 0;
-        let mut needs_wait = false;
-
-        // Traitement prioritaire du premier pattern défensif
-        let (defensive1_pixels, wait_needed) = client.process_pattern(
-            &mut auth,
-            &defensive1_pattern,
-            args.defensive1_x,
-            args.defensive1_y,
-            &board,
-            &colors,
-            MAX_PIXELS_PER_BATCH
-        ).await?;
-
-        total_pixels_placed += defensive1_pixels;
-        needs_wait = wait_needed;
-
-        // Si on n'a pas utilisé tous nos pixels sur la première défense et qu'on n'a pas besoin d'attendre,
-        // on passe au deuxième pattern défensif
-        if !needs_wait && total_pixels_placed < MAX_PIXELS_PER_BATCH {
-            let remaining_pixels = MAX_PIXELS_PER_BATCH - total_pixels_placed;
-            let (defensive2_pixels, wait_needed) = client.process_pattern(
+            let mut total_pixels_placed = 0;
+            let mut wait_duration = None;
+            
+            // Traitement prioritaire du premier pattern défensif
+            let (defensive1_pixels, def1_wait) = client.process_pattern(
                 &mut auth,
-                &defensive2_pattern,
-                args.defensive2_x,
-                args.defensive2_y,
+                &defensive1_pattern,
+                args.defensive1_x,
+                args.defensive1_y,
                 &board,
                 &colors,
-                remaining_pixels
+                MAX_PIXELS_PER_BATCH
             ).await?;
 
-            total_pixels_placed += defensive2_pixels;
-            needs_wait = wait_needed;
+            total_pixels_placed += defensive1_pixels;
+            if let Some(duration) = def1_wait {
+                wait_duration = Some(duration);
+            } else if total_pixels_placed < MAX_PIXELS_PER_BATCH {
+                // Si on n'a pas utilisé tous nos pixels sur la première défense,
+                // on passe au deuxième pattern défensif
+                let remaining_pixels = MAX_PIXELS_PER_BATCH - total_pixels_placed;
+                let (defensive2_pixels, def2_wait) = client.process_pattern(
+                    &mut auth,
+                    &defensive2_pattern,
+                    args.defensive2_x,
+                    args.defensive2_y,
+                    &board,
+                    &colors,
+                    remaining_pixels
+                ).await?;
+
+                total_pixels_placed += defensive2_pixels;
+                if let Some(duration) = def2_wait {
+                    wait_duration = Some(duration);
+                } else if total_pixels_placed < MAX_PIXELS_PER_BATCH {
+                    // Si on n'a toujours pas utilisé tous nos pixels,
+                    // on travaille sur le pattern de construction
+                    let remaining_pixels = MAX_PIXELS_PER_BATCH - total_pixels_placed;
+                    let (build_pixels, build_wait) = client.process_pattern(
+                        &mut auth,
+                        &build_pattern,
+                        args.build_x,
+                        args.build_y,
+                        &board,
+                        &colors,
+                        remaining_pixels
+                    ).await?;
+
+                    total_pixels_placed += build_pixels;
+                    if let Some(duration) = build_wait {
+                        wait_duration = Some(duration);
+                    }
+                }
+            }
+
+            info!("Placed {} pixels in total this batch", total_pixels_placed);
+            
+            // Mettre à jour le prochain temps d'update
+            if let Some(duration) = wait_duration {
+                next_update = Utc::now() + chrono::Duration::from_std(duration)?;
+            } else {
+                next_update = Utc::now() + chrono::Duration::minutes(BATCH_DELAY_MINUTES as i64);
+            }
         }
 
-        // Si on n'a toujours pas utilisé tous nos pixels et qu'on n'a pas besoin d'attendre,
-        // on travaille sur le pattern de construction
-        if !needs_wait && total_pixels_placed < MAX_PIXELS_PER_BATCH {
-            let remaining_pixels = MAX_PIXELS_PER_BATCH - total_pixels_placed;
-            let (build_pixels, wait_needed) = client.process_pattern(
-                &mut auth,
-                &build_pattern,
-                args.build_x,
-                args.build_y,
-                &board,
-                &colors,
-                remaining_pixels
-            ).await?;
-
-            total_pixels_placed += build_pixels;
-            needs_wait = wait_needed;
+        // Afficher le temps restant
+        let wait_time = next_update.signed_duration_since(Utc::now());
+        if wait_time.num_seconds() > 0 {
+            let mins = wait_time.num_minutes();
+            let secs = wait_time.num_seconds() % 60;
+            info!("Remaining time: {}m {}s", mins, secs);
+            sleep(Duration::from_secs(10)).await;  // Update every 10 seconds
         }
-
-        info!("Placed {} pixels in total this batch", total_pixels_placed);
-        info!("Waiting {} minutes before next batch", BATCH_DELAY_MINUTES);
-        sleep(Duration::from_secs(BATCH_DELAY_MINUTES * 60)).await;
     }
 }
