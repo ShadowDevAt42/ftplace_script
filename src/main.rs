@@ -12,7 +12,7 @@ use clap::Parser;
 use std::time::Duration;
 use tokio::time::sleep;
 
-const BOARD_SIZE: usize = 200;
+const BOARD_SIZE: usize = 250;
 const MAX_PIXELS_PER_BATCH: usize = 10;
 const BATCH_DELAY_MINUTES: u64 = 31;
 const MAX_RETRIES: u32 = 10;
