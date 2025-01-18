@@ -554,7 +554,3 @@ To suggest a new feature:
 2. Open an issue with the "enhancement" label
 3. Describe the feature and its use case
 4. Wait for feedback before starting implementation
-
-## License
-
-This project is licensed under the MIT License. See the `LICENSE` file for details.
