@@ -15,6 +15,8 @@ use tokio::time::sleep;
 const BOARD_SIZE: usize = 200;
 const MAX_PIXELS_PER_BATCH: usize = 10;
 const BATCH_DELAY_MINUTES: u64 = 31;
+const MAX_RETRIES: u32 = 10;
+const RETRY_DELAY: Duration = Duration::from_secs(120); // 2 minutes
 
 #[derive(Deserialize, Debug)]
 struct Pattern {
@@ -144,6 +146,84 @@ impl PlaceClient {
         })
     }
 
+    async fn get_board(&self) -> Result<(HashMap<u8, Color>, Vec<Vec<u8>>)> {
+        let url = format!("{}/api/get?type=board", self.base_url);
+        let mut retries = 0;
+
+        loop {
+            debug!("Requesting board from URL: {}", url);
+            
+            match self.client.get(&url).send().await {
+                Ok(response) => {
+                    debug!("Response status: {}", response.status());
+
+                    if response.status() == reqwest::StatusCode::BAD_GATEWAY {
+                        if retries >= MAX_RETRIES {
+                            error!("Max retries ({}) reached for 502 error, stopping script", MAX_RETRIES);
+                            return Err(anyhow!("Failed to connect after {} retries", MAX_RETRIES));
+                        }
+
+                        retries += 1;
+                        info!("Received 502 Bad Gateway (attempt {}/{}), waiting {} seconds before retry", 
+                            retries, MAX_RETRIES, RETRY_DELAY.as_secs());
+                        sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+
+                    if !response.status().is_success() {
+                        return Err(anyhow!("Request failed with status: {}", response.status()));
+                    }
+
+                    let board_data: BoardResponse = response.json().await?;
+                    
+                    let colors: HashMap<u8, Color> = board_data.colors
+                        .into_iter()
+                        .map(|c| (c.id, c))
+                        .collect();
+                    
+                    debug!("Loaded {} color definitions", colors.len());
+
+                    let mut board_matrix = vec![vec![0u8; BOARD_SIZE]; BOARD_SIZE];
+                    
+                    for (y, row) in board_data.board.iter().enumerate() {
+                        for (x, pixel) in row.iter().enumerate() {
+                            board_matrix[y][x] = pixel.color_id;
+                        }
+                    }
+
+                    let mut rotated_matrix = vec![vec![0u8; BOARD_SIZE]; BOARD_SIZE];
+                    for y in 0..BOARD_SIZE {
+                        for x in 0..BOARD_SIZE {
+                            rotated_matrix[x][BOARD_SIZE - 1 - y] = board_matrix[y][x];
+                        }
+                    }
+
+                    let mut final_matrix = vec![vec![0u8; BOARD_SIZE]; BOARD_SIZE];
+                    for y in 0..BOARD_SIZE {
+                        for x in 0..BOARD_SIZE {
+                            final_matrix[y][BOARD_SIZE - 1 - x] = rotated_matrix[y][x];
+                        }  
+                    }
+
+                    info!("Board matrix constructed successfully");
+                    return Ok((colors, final_matrix));
+                },
+                Err(e) => {
+                    if retries >= MAX_RETRIES {
+                        error!("Max retries ({}) reached for connection error, stopping script", MAX_RETRIES);
+                        return Err(anyhow!("Failed to connect after {} retries: {}", MAX_RETRIES, e));
+                    }
+
+                    retries += 1;
+                    error!("Connection error (attempt {}/{}): {}", retries, MAX_RETRIES, e);
+                    info!("Waiting {} seconds before retry", RETRY_DELAY.as_secs());
+                    sleep(RETRY_DELAY).await;
+                    continue;
+                }
+            }
+        }
+    }
+
     fn calculate_wait_interval(&self, response: &str) -> Result<Duration> {
         let timer_response: TimerResponse = serde_json::from_str(response)?;
         let mut earliest_available = None;
@@ -187,56 +267,6 @@ impl PlaceClient {
 
         // If it goes wrong try the old method and wait 31 minutes
         Ok(Duration::from_secs(BATCH_DELAY_MINUTES * 60))
-    }
-
-    async fn get_board(&self) -> Result<(HashMap<u8, Color>, Vec<Vec<u8>>)> {
-        let url = format!("{}/api/get?type=board", self.base_url);
-        debug!("Requesting board from URL: {}", url);
-        
-        let response = self.client
-            .get(&url)
-            .send()
-            .await?;
-
-        debug!("Response status: {}", response.status());
-
-        if !response.status().is_success() {
-            return Err(anyhow!("Request failed with status: {}", response.status()));
-        }
-
-        let board_data: BoardResponse = response.json().await?;
-        
-        let colors: HashMap<u8, Color> = board_data.colors
-            .into_iter()
-            .map(|c| (c.id, c))
-            .collect();
-        
-        debug!("Loaded {} color definitions", colors.len());
-
-        let mut board_matrix = vec![vec![0u8; BOARD_SIZE]; BOARD_SIZE];
-        
-        for (y, row) in board_data.board.iter().enumerate() {
-            for (x, pixel) in row.iter().enumerate() {
-                board_matrix[y][x] = pixel.color_id;
-            }
-        }
-
-        let mut rotated_matrix = vec![vec![0u8; BOARD_SIZE]; BOARD_SIZE];
-        for y in 0..BOARD_SIZE {
-            for x in 0..BOARD_SIZE {
-                rotated_matrix[x][BOARD_SIZE - 1 - y] = board_matrix[y][x];
-            }
-        }
-
-        let mut final_matrix = vec![vec![0u8; BOARD_SIZE]; BOARD_SIZE];
-        for y in 0..BOARD_SIZE {
-            for x in 0..BOARD_SIZE {
-                final_matrix[y][BOARD_SIZE - 1 - x] = rotated_matrix[y][x];
-            }  
-        }
-
-        info!("Board matrix constructed successfully");
-        Ok((colors, final_matrix))
     }
 
     async fn place_pixel(&self, auth: &mut Auth, x: u32, y: u32, color_id: u8, colors: &HashMap<u8, Color>) -> Result<(bool, Option<Duration>)> {
