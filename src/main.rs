@@ -1,19 +1,36 @@
-// Custom mods
 mod place_client;
+mod config;
+mod args_parser;
 
-use serde::{Deserialize, Serialize};
-use reqwest::Client;
 use tokio;
-use anyhow::{Result, anyhow}; 
-use log::{info, error, debug, LevelFilter};
+use anyhow::Result;
+use log::{info, LevelFilter};
 use env_logger::Builder;
 use image::{ImageBuffer, Rgb};
-use std::fs;
 use chrono::{Local, Utc};
-use clap::Parser;
-use std::time::Duration;
-use std::collections::HashMap;
 use tokio::time::sleep;
+use clap::Parser;
+
+use std::{
+    fs,
+    collections::HashMap,
+    process::exit,
+    time::Duration,
+};
+
+use args_parser::{
+    parse_patterns,
+    Args,
+    ArgSpecs
+};
+
+use config::{
+    MAX_PIXELS_PER_BATCH,
+    BATCH_DELAY_MINUTES,
+    MAX_RETRIES,
+    RETRY_DELAY,
+    BOARD_SIZE,
+};
 
 use place_client::{
     Color,
@@ -21,72 +38,6 @@ use place_client::{
     Pattern,
     Auth,
 };
-
-// consts
-const MAX_PIXELS_PER_BATCH: usize = 10;
-pub const BATCH_DELAY_MINUTES: u64 = 31;
-pub const MAX_RETRIES: u32 = 10;
-pub const RETRY_DELAY: Duration = Duration::from_secs(120); // 2 minutes
-pub const BOARD_SIZE: usize = 250;
-
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    #[arg(long)]
-    refresh_token: String,
-    
-    #[arg(long)]
-    token: String,
-
-    // Pattern obligatoire
-    #[arg(long)]
-    defensive1_x: u32,
-
-    #[arg(long)]
-    defensive1_y: u32,
-
-    #[arg(long)]
-    defensive1_pattern: String,
-
-    // Patterns optionnels
-    #[arg(long)]
-    defensive2_x: Option<u32>,
-
-    #[arg(long)]
-    defensive2_y: Option<u32>,
-
-    #[arg(long)]
-    defensive2_pattern: Option<String>,
-
-    #[arg(long)]
-    build1_x: Option<u32>,
-
-    #[arg(long)]
-    build1_y: Option<u32>,
-
-    #[arg(long)]
-    build1_pattern: Option<String>,
-
-    #[arg(long)]
-    build2_x: Option<u32>,
-
-    #[arg(long)]
-    build2_y: Option<u32>,
-
-    #[arg(long)]
-    build2_pattern: Option<String>,
-
-    #[arg(long)]
-    build3_x: Option<u32>,
-
-    #[arg(long)]
-    build3_y: Option<u32>,
-
-    #[arg(long)]
-    build3_pattern: Option<String>,
-}
-
-
 
 fn save_board_state(colors: &HashMap<u8, Color>, board: &Vec<Vec<u8>>, timestamp: &str) -> Result<()> {
     // Créer un fichier avec la correspondance des couleurs
@@ -125,6 +76,8 @@ fn save_board_state(colors: &HashMap<u8, Color>, board: &Vec<Vec<u8>>, timestamp
     Ok(())
 }
 
+
+
 #[tokio::main]
 async fn main() -> Result<()> {
     Builder::new()
@@ -135,55 +88,21 @@ async fn main() -> Result<()> {
     info!("Starting Place client with multiple patterns support");
 
     let args = Args::parse();
-    
-    // Chargement du pattern obligatoire
-    let defensive1_content = fs::read_to_string(&args.defensive1_pattern)?;
-    let defensive1_pattern: Pattern = serde_json::from_str(&defensive1_content)?;
-    
-    // Chargement des patterns optionnels
-    let defensive2_pattern = if let Some(pattern_path) = &args.defensive2_pattern {
-        if let (Some(x), Some(y)) = (args.defensive2_x, args.defensive2_y) {
-            let content = fs::read_to_string(pattern_path)?;
-            Some((serde_json::from_str(&content)?, x, y))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // Get pattern path, x, y, and priority into a vector
+    let mut patterns: Vec<ArgSpecs> = args.patterns
+        .iter()
+        .filter_map(|pattern| {
+            match parse_patterns(pattern) {
+                Ok(pattern) => Some(pattern),
+                Err(e) => {
+                    eprintln!("Error parsing pattern: {} {}", e, pattern);
+                    exit(1);
+                }
+            }
+        })
+        .collect();
 
-    let build1_pattern = if let Some(pattern_path) = &args.build1_pattern {
-        if let (Some(x), Some(y)) = (args.build1_x, args.build1_y) {
-            let content = fs::read_to_string(pattern_path)?;
-            Some((serde_json::from_str(&content)?, x, y))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let build2_pattern = if let Some(pattern_path) = &args.build2_pattern {
-        if let (Some(x), Some(y)) = (args.build2_x, args.build2_y) {
-            let content = fs::read_to_string(pattern_path)?;
-            Some((serde_json::from_str(&content)?, x, y))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let build3_pattern = if let Some(pattern_path) = &args.build3_pattern {
-        if let (Some(x), Some(y)) = (args.build3_x, args.build3_y) {
-            let content = fs::read_to_string(pattern_path)?;
-            Some((serde_json::from_str(&content)?, x, y))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    patterns.sort();
 
     fs::create_dir_all("map")?;
 
@@ -194,154 +113,50 @@ async fn main() -> Result<()> {
     };
 
     let mut next_update = Utc::now();
-    
+
     loop {
-        if Utc::now() >= next_update {
-            let now = Local::now();
-            let timestamp = now.format("%Y-%m-%d_%H-%M-%S").to_string();
+        let mut total_pixels_placed = 0;
+        let mut wait_duration = None;
 
-            let (colors, board) = client.get_board().await?;
-            save_board_state(&colors, &board, &timestamp)?;
+        for (_, pattern) in patterns.iter().enumerate() {
+            let pattern_content = fs::read_to_string(&pattern.pattern_path).unwrap();
+            let pattern_json: Pattern = serde_json::from_str(&pattern_content)
+                .expect("Couldn't deserilize into");
 
-            let mut total_pixels_placed = 0;
-            let mut wait_duration = None;
-            
-            // Traitement prioritaire du premier pattern défensif (obligatoire)
-            let (defensive1_pixels, def1_wait) = client.process_pattern(
-                &mut auth,
-                &defensive1_pattern,
-                args.defensive1_x,
-                args.defensive1_y,
-                &board,
-                &colors,
-                MAX_PIXELS_PER_BATCH
-            ).await?;
+            if Utc::now() >= next_update {
+                //WARN: this could go wrong if the local time is not sync
+                let now = Local::now();
+                let timestamp = now.format("%Y-%m-%d_%H-%M-%S").to_string();
 
-            total_pixels_placed += defensive1_pixels;
-            if let Some(duration) = def1_wait {
-                wait_duration = Some(duration);
-            }
+                let (colors, board) = client.get_board().await?;
+                save_board_state(&colors, &board, &timestamp)?;
 
-            // Continue avec les pixels restants même si on a reçu un timer
-            if total_pixels_placed < MAX_PIXELS_PER_BATCH {
-                // Pattern défensif 2 (optionnel)
-                if let Some((pattern, x, y)) = &defensive2_pattern {
-                    let remaining_pixels = MAX_PIXELS_PER_BATCH - total_pixels_placed;
-                    let (defensive2_pixels, def2_wait) = client.process_pattern(
-                        &mut auth,
-                        pattern,
-                        *x,
-                        *y,
-                        &board,
-                        &colors,
-                        remaining_pixels
-                    ).await?;
+                let (defensive1_pixels, def1_wait) = client.process_pattern(
+                    &mut auth,
+                    &pattern_json,
+                    pattern.x,
+                    pattern.y,
+                    &board,
+                    MAX_PIXELS_PER_BATCH
+                ).await?;
 
-                    total_pixels_placed += defensive2_pixels;
-                    if let Some(duration) = def2_wait {
-                        if let Some(current) = wait_duration {
-                            if duration < current {
-                                wait_duration = Some(duration);
-                            }
-                        } else {
-                            wait_duration = Some(duration);
-                        }
-                    }
+                total_pixels_placed += defensive1_pixels;
+                if let Some(duration) = def1_wait {
+                    wait_duration = Some(duration);
+                }
+
+                if total_pixels_placed < MAX_PIXELS_PER_BATCH {
+                    continue;
+                } else {
+                    next_update = Utc::now() + if let Some(duration) = wait_duration {
+                        chrono::Duration::from_std(duration)?
+                    } else {
+                        chrono::Duration::minutes(BATCH_DELAY_MINUTES as i64)
+                    };
+                    break;
                 }
             }
-
-            // Continue avec build1 s'il reste des pixels
-            if total_pixels_placed < MAX_PIXELS_PER_BATCH {
-                if let Some((pattern, x, y)) = &build1_pattern {
-                    let remaining_pixels = MAX_PIXELS_PER_BATCH - total_pixels_placed;
-                    let (build1_pixels, build1_wait) = client.process_pattern(
-                        &mut auth,
-                        pattern,
-                        *x,
-                        *y,
-                        &board,
-                        &colors,
-                        remaining_pixels
-                    ).await?;
-
-                    total_pixels_placed += build1_pixels;
-                    if let Some(duration) = build1_wait {
-                        if let Some(current) = wait_duration {
-                            if duration < current {
-                                wait_duration = Some(duration);
-                            }
-                        } else {
-                            wait_duration = Some(duration);
-                        }
-                    }
-                }
-            }
-
-            // Continue avec build2 s'il reste des pixels
-            if total_pixels_placed < MAX_PIXELS_PER_BATCH {
-                if let Some((pattern, x, y)) = &build2_pattern {
-                    let remaining_pixels = MAX_PIXELS_PER_BATCH - total_pixels_placed;
-                    let (build2_pixels, build2_wait) = client.process_pattern(
-                        &mut auth,
-                        pattern,
-                        *x,
-                        *y,
-                        &board,
-                        &colors,
-                        remaining_pixels
-                    ).await?;
-
-                    total_pixels_placed += build2_pixels;
-                    if let Some(duration) = build2_wait {
-                        if let Some(current) = wait_duration {
-                            if duration < current {
-                                wait_duration = Some(duration);
-                            }
-                        } else {
-                            wait_duration = Some(duration);
-                        }
-                    }
-                }
-            }
-
-            // Enfin, continue avec build3 s'il reste des pixels
-            if total_pixels_placed < MAX_PIXELS_PER_BATCH {
-                if let Some((pattern, x, y)) = &build3_pattern {
-                    let remaining_pixels = MAX_PIXELS_PER_BATCH - total_pixels_placed;
-                    let (build3_pixels, build3_wait) = client.process_pattern(
-                        &mut auth,
-                        pattern,
-                        *x,
-                        *y,
-                        &board,
-                        &colors,
-                        remaining_pixels
-                    ).await?;
-
-                    total_pixels_placed += build3_pixels;
-                    if let Some(duration) = build3_wait {
-                        if let Some(current) = wait_duration {
-                            if duration < current {
-                                wait_duration = Some(duration);
-                            }
-                        } else {
-                            wait_duration = Some(duration);
-                        }
-                    }
-                }
-            }
-
-            info!("Placed {} pixels in total this batch", total_pixels_placed);
-            
-            // Utilise le plus petit timer reçu ou le délai par défaut
-            next_update = Utc::now() + if let Some(duration) = wait_duration {
-                chrono::Duration::from_std(duration)?
-            } else {
-                chrono::Duration::minutes(BATCH_DELAY_MINUTES as i64)
-            };
         }
-
-        // Afficher le temps restant
         let wait_time = next_update.signed_duration_since(Utc::now());
         if wait_time.num_seconds() > 0 {
             let mins = wait_time.num_minutes();

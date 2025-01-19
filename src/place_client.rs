@@ -1,11 +1,11 @@
 use reqwest::Client;
 use anyhow::{Result, anyhow};
-use log::{info, error, debug, LevelFilter};
+use log::{info, error, debug};
 use std::collections::HashMap;
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
-use chrono::{Local, Utc};
+use chrono::Utc;
 use crate::{
     BATCH_DELAY_MINUTES,
     MAX_RETRIES,
@@ -33,6 +33,7 @@ pub struct PlaceClient {
     base_url: String,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 struct Pixel {
     username: String,
@@ -40,6 +41,7 @@ struct Pixel {
     set_time: String,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 struct BoardResponse {
     colors: Vec<Color>,
@@ -50,8 +52,8 @@ struct BoardResponse {
 
 #[derive(Serialize, Debug)]
 struct PlacePixelRequest {
-    x: u32,
-    y: u32,
+    x: i32,
+    y: i32,
     color: String,
 }
 
@@ -68,8 +70,8 @@ pub struct Pattern {
 
 #[derive(Deserialize, Debug)]
 struct PatternPixel {
-    x: u32,
-    y: u32,
+    x: i32,
+    y: i32,
     color: u8,
 }
 
@@ -203,7 +205,7 @@ impl PlaceClient {
         Ok(Duration::from_secs(BATCH_DELAY_MINUTES * 60))
     }
 
-    async fn place_pixel(&self, auth: &mut Auth, x: u32, y: u32, color_id: u8, colors: &HashMap<u8, Color>) -> Result<(bool, Option<Duration>)> {
+    async fn place_pixel(&self, auth: &mut Auth, x: i32, y: i32, color_id: u8) -> Result<(bool, Option<Duration>)> {
         let url = format!("{}/api/set", self.base_url);
         
         let request = PlacePixelRequest {
@@ -285,10 +287,9 @@ impl PlaceClient {
     pub(crate) async fn process_pattern(&self,
                                         auth: &mut Auth,
                                         pattern: &Pattern,
-                                        start_x: u32,
-                                        start_y: u32,
+                                        start_x: i32,
+                                        start_y: i32,
                                         board: &Vec<Vec<u8>>,
-                                        colors: &HashMap<u8, Color>,
                                         max_pixels: usize
     ) -> Result<(usize, Option<Duration>)> {
         let mut pixels_placed = 0;
@@ -299,10 +300,10 @@ impl PlaceClient {
                 break;
             }
 
-            let target_x = start_x + p.x;
-            let target_y = start_y + p.y;
+            let target_x: i32 = start_x + p.x;
+            let target_y: i32 = start_y + p.y;
             
-            if target_x >= BOARD_SIZE as u32 || target_y >= BOARD_SIZE as u32 {
+            if target_x >= BOARD_SIZE as i32 || target_y >= BOARD_SIZE as i32 {
                 error!("Pattern point ({}, {}) out of bounds", target_x, target_y);
                 continue;
             }
@@ -312,7 +313,7 @@ impl PlaceClient {
                 let max_retries = 3;
 
                 while retries < max_retries {
-                    match self.place_pixel(auth, target_x, target_y, p.color, colors).await {
+                    match self.place_pixel(auth, target_x, target_y, p.color).await {
                         Ok((needs_refresh, new_wait_duration)) => {
                             if needs_refresh {
                                 info!("Retrying with new tokens");

@@ -148,41 +148,34 @@ La commande supporte plusieurs patterns avec un système de priorité :
 ./target/release/place_client \
   --refresh-token "votre_refresh_token" \
   --token "votre_token" \
-  --defensive1_x 100 \
-  --defensive1_y 100 \
-  --defensive1_pattern "pattern/defensive1.json" \
-  --defensive2_x 150 \
-  --defensive2_y 150 \
-  --defensive2_pattern "pattern/defensive2.json" \
-  --build1_x 200 \
-  --build1_y 200 \
-  --build1_pattern "pattern/build1.json" \
-  --build2_x 250 \
-  --build2_y 250 \
-  --build2_pattern "pattern/build2.json" \
-  --build3_x 300 \
-  --build3_y 300 \
-  --build3_pattern "pattern/build3.json"
+  --pattern "/path/to/pattern1.json 12 24 2"
+  --pattern "/path/to/pattern2.json 42 21 1"
 ```
 
 ### Paramètres obligatoires
 - `refresh-token` : Token de rafraîchissement
 - `token` : Token d'authentification
-- `defensive1_x`, `defensive1_y` : Coordonnées du pattern défensif principal
-- `defensive1_pattern` : Chemin vers le fichier du pattern défensif principal
 
-### Paramètres optionnels
-- `defensive2_*` : Pattern défensif secondaire
-- `build1_*` : Premier pattern de construction
-- `build2_*` : Deuxième pattern de construction
-- `build3_*` : Troisième pattern de construction
+### Autres Paramètres
+- `pattern` : ceci indique que le suivant est un pattern à dessiner. Le format est le suivant :
+    - Chemin vers un fichier JSON qui contient le pattern.
+    - Coordonnées x et y de début du pattern sur la carte.
+    - Priorité : indique quel pattern sera dessiné devant les autres.
 
 ## Fonctionnalités
 
 - Système de priorité :
-  1. Pattern défensif principal
-  2. Pattern défensif secondaire
-  3. Patterns de construction (1-3)
+Vous pouvez fournir autant de patterns que vous le souhaitez. 
+Chaque pattern doit être associé à une priorité. 
+La priorité détermine l'ordre dans lequel les patterns seront dessinés :
+    - Une priorité de 1 signifie que le pattern sera dessiné en premier.
+    - Les patterns avec des priorités plus élevées seront dessinés ensuite, 
+    un par un, dans l'ordre croissant des priorités.
+
+> Le système commence par dessiner un pattern. 
+> Si le pattern est complet, il passe au suivant, 
+> en fonction de la priorité.
+
 - Gestion des erreurs 502 avec retry automatique (10 tentatives, 2 minutes d'attente)
 - Place jusqu'à 10 pixels toutes les 31 minutes
 - Vérifie l'état actuel avant de placer un pixel
@@ -444,21 +437,26 @@ The command supports multiple patterns with a priority system:
 ### Required Parameters
 - `refresh-token`: Refresh token
 - `token`: Authentication token
-- `defensive1_x`, `defensive1_y`: Main defensive pattern coordinates
-- `defensive1_pattern`: Path to main defensive pattern file
 
-### Optional Parameters
-- `defensive2_*`: Secondary defensive pattern
-- `build1_*`: First build pattern
-- `build2_*`: Second build pattern
-- `build3_*`: Third build pattern
+### Other Parameters
+- `pattern`: This indicates that the next entry is a pattern to be drawn. The format is as follows:
+    - Path to a JSON file containing the pattern.
+    - x and y coordinates for the starting position of the pattern on the map.
+    - Priority indicates which pattern will be drawn in front of the others.
 
 ## Features
 
 - Priority system:
-  1. Main defensive pattern
-  2. Secondary defensive pattern
-  3. Build patterns (1-3)
+You can provide as many patterns as you like.
+Each pattern must be associated with a priority.
+The priority determines the order in which the patterns will be drawn:
+    - A priority of 1 means the pattern will be drawn first.
+    - Patterns with higher priorities will be drawn afterward, 
+    one by one, in ascending order of priority.
+
+> The system starts by drawing the first pattern.
+> If the pattern is complete, it moves to the next one according to its priority.
+
 - 502 error handling with automatic retry (10 attempts, 2 minutes wait)
 - Places up to 10 pixels every 31 minutes
 - Checks current state before placing pixels
